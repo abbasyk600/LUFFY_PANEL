@@ -291,7 +291,9 @@ def build_vless_url(
     params = []
     params.append(f"type=ws")
     params.append(f"security={tls}")
-    params.append(f"path={path}")
+    # Include inbound_id in the WS path: /ws/{inbound_id}
+    full_path = f"{path.rstrip('/')}/{inbound_id}" if inbound_id else path
+    params.append(f"path={full_path}")
     if sni:
         params.append(f"sni={sni}")
     if alpn:
@@ -827,7 +829,7 @@ async def export_configs(request: Request, host: Optional[str] = Query(None)):
                 host=request_host,
                 port=row["port"],
                 path=row["ws_path"],
-                tls=row["upstream_tls"],
+                tls="tls",
                 sni=row["sni"] or request_host,
                 alpn=row["alpn"],
                 fp=row["fingerprint"],
