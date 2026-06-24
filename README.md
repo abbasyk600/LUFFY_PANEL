@@ -1,3 +1,12 @@
+---
+title: Luffy Panel
+emoji: 🏴‍☠️
+colorFrom: red
+colorTo: gray
+sdk: docker
+pinned: false
+---
+
 # 🌊 Luffy Panel - VLESS Proxy Manager
 
 <div dir="rtl">
