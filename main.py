@@ -45,6 +45,13 @@ RATE_LIMIT = os.getenv("RATE_LIMIT", "100/minute")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ═══════════════════════════════════════════════
+# Logging
+# ═══════════════════════════════════════════════
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("LuffyPanel")
+
+# ═══════════════════════════════════════════════
 # Rate Limiter
 # ═══════════════════════════════════════════════
 
@@ -332,10 +339,8 @@ async def set_setting(db: aiosqlite.Connection, key: str, value: str):
     await db.commit()
 
 
-async def record_traffic(
-    db: aiosqlite.Connection, inbound_id: str, upload: int, download: int
-):
-    """Record traffic for an inbound (increment total and daily history)."""
+async def record_traffic(db: aiosqlite.Connection, inbound_id: str, upload: int, download: int):
+    """Record traffic usage."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # Update inbound totals
@@ -353,85 +358,55 @@ async def record_traffic(
         """INSERT INTO traffic_history(inbound_id, date, upload, download)
            VALUES(?, ?, ?, ?)
            ON CONFLICT(inbound_id, date) DO UPDATE SET
-           upload = upload + ?,
-           download = download + ?""",
+           upload = upload + ?, download = download + ?""",
         (inbound_id, today, upload, download, upload, download),
     )
 
-    # Update global totals in settings
-    current_up = int(await get_setting(db, "total_global_upload", "0"))
-    current_down = int(await get_setting(db, "total_global_download", "0"))
-    await set_setting(db, "total_global_upload", str(current_up + upload))
-    await set_setting(db, "total_global_download", str(current_down + download))
+    # Update global totals
+    for direction, amount in [("total_global_upload", upload), ("total_global_download", download)]:
+        current = int(await get_setting(db, direction, "0"))
+        await set_setting(db, direction, str(current + amount))
 
     await db.commit()
 
 
-async def cleanup_expired(db: aiosqlite.Connection) -> int:
-    """Remove expired inbounds. Returns count of removed items."""
-    cursor = await db.execute(
-        "SELECT inbound_id, tag FROM inbounds WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')"
-    )
-    expired = await cursor.fetchall()
-    count = 0
-    for row in expired:
-        await db.execute("DELETE FROM inbounds WHERE inbound_id=?", (row["inbound_id"],))
-        await db.execute(
-            "DELETE FROM traffic_history WHERE inbound_id=?", (row["inbound_id"],)
-        )
-        await db.execute(
-            "DELETE FROM connection_logs WHERE inbound_id=?", (row["inbound_id"],)
-        )
-        count += 1
-    if count:
-        await db.commit()
-    return count
-
-
-async def cleanup_old_traffic_history(db: aiosqlite.Connection):
-    """Remove traffic history older than MAX_DAILY_TRAFFIC_HISTORY days."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=MAX_DAILY_TRAFFIC_HISTORY)).strftime("%Y-%m-%d")
-    await db.execute("DELETE FROM traffic_history WHERE date < ?", (cutoff,))
-    await db.commit()
-
-
-async def log_connection(
-    db: aiosqlite.Connection,
-    inbound_id: str,
-    client_ip: str = "",
-    upload: int = 0,
-    download: int = 0,
-):
-    """Log a connection event."""
+async def log_connection(db: aiosqlite.Connection, inbound_id: str, client_ip: str,
+                         upload: int, download: int):
+    """Log a connection."""
     await db.execute(
-        """INSERT INTO connection_logs(inbound_id, client_ip, connected_at, upload_bytes, download_bytes)
-           VALUES(?, ?, CURRENT_TIMESTAMP, ?, ?)""",
+        """INSERT INTO connection_logs(inbound_id, client_ip, upload_bytes, download_bytes)
+           VALUES(?, ?, ?, ?)""",
         (inbound_id, client_ip, upload, download),
     )
     await db.commit()
 
 
-def format_bytes(b: int) -> str:
-    """Format bytes to human-readable string."""
-    if b < 1024:
-        return f"{b} B"
-    elif b < 1024 * 1024:
-        return f"{b / 1024:.1f} KB"
-    elif b < 1024 * 1024 * 1024:
-        return f"{b / (1024 * 1024):.2f} MB"
-    else:
-        return f"{b / (1024 * 1024 * 1024):.2f} GB"
-
-
-def format_datetime(dt_str: str) -> str:
-    """Format a datetime string nicely."""
-    if not dt_str:
-        return "—"
-    try:
-        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return dt_str
+async def background_cleanup_loop():
+    """Background task to clean up expired inbounds."""
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL)
+        try:
+            db = await get_db()
+            try:
+                cursor = await db.execute(
+                    """SELECT inbound_id FROM inbounds
+                       WHERE expires_at IS NOT NULL AND enabled=1
+                         AND expires_at < datetime('now')"""
+                )
+                expired = await cursor.fetchall()
+                for row in expired:
+                    await db.execute(
+                        "UPDATE inbounds SET enabled=0 WHERE inbound_id=?",
+                        (row["inbound_id"],),
+                    )
+                    logging.info(f"[Cleanup] Disabled expired inbound: {row['inbound_id']}")
+                if expired:
+                    await db.commit()
+                    await update_xray_config()
+            finally:
+                await db.close()
+        except Exception as e:
+            logging.error(f"[Cleanup] Error: {e}")
 
 
 # ═══════════════════════════════════════════════
@@ -441,65 +416,33 @@ def format_datetime(dt_str: str) -> str:
 async def security_headers_middleware(request: Request, call_next):
     """Add security headers to all responses."""
     response = await call_next(request)
-    response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-        "font-src 'self' https://fonts.gstatic.com; "
-        "img-src 'self' data: blob: https:; "
-        "connect-src 'self' ws: wss:; "
-        "frame-ancestors 'none';"
-    )
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     return response
 
 
 # ═══════════════════════════════════════════════
-# Background Tasks
-# ═══════════════════════════════════════════════
-
-async def background_cleanup_loop():
-    """Periodically clean up expired inbounds and old traffic history."""
-    while True:
-        try:
-            db = await get_db()
-            try:
-                removed = await cleanup_expired(db)
-                await cleanup_old_traffic_history(db)
-                if removed:
-                    print(f"[Cleanup] Removed {removed} expired inbounds")
-            finally:
-                await db.close()
-        except Exception as e:
-            print(f"[Cleanup] Error: {e}")
-        await asyncio.sleep(CLEANUP_INTERVAL)
-
-
-# ═══════════════════════════════════════════════
-# App Lifecycle
+# Lifespan
 # ═══════════════════════════════════════════════
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     await init_db()
-    print(f"[Luffy Panel] Database initialized at {DB_PATH}")
-    print(f"[Luffy Panel] Admin password: {ADMIN_PASSWORD}")
+    logging.info(f"Database initialized at {DB_PATH}")
+    logging.info(f"Admin password: {ADMIN_PASSWORD}")
     if XRAY_ENABLED:
         await update_xray_config()
         xray_proc = await start_xray()
         if xray_proc:
             app.state.xray_proc = xray_proc
-            print(f"[Luffy Panel] Xray-core running on port {XRAY_LOCAL_PORT}")
+            logging.info(f"Xray-core running on port {XRAY_LOCAL_PORT}")
         else:
-            print("[Luffy Panel] WARNING: Xray-core failed to start")
+            logging.warning("Xray-core failed to start")
     else:
-        print("[Luffy Panel] Xray-core not found - proxy-only mode")
+        logging.info("Xray-core not found - proxy-only mode")
     cleanup_task = asyncio.create_task(background_cleanup_loop())
     app.state.cleanup_task = cleanup_task
     yield
@@ -508,7 +451,7 @@ async def lifespan(app: FastAPI):
         await cleanup_task
     except asyncio.CancelledError:
         pass
-    print("[Luffy Panel] Shutting down")
+    logging.info("Shutting down")
 
 
 # ═══════════════════════════════════════════════
@@ -528,7 +471,7 @@ app.middleware("http")(security_headers_middleware)
 
 
 # ═══════════════════════════════════════════════
-# API Routes — Inbound Management
+# API Routes - Inbounds
 # ═══════════════════════════════════════════════
 
 @app.get("/api/inbounds")
@@ -541,9 +484,9 @@ async def list_inbounds(request: Request):
             "SELECT * FROM inbounds ORDER BY created_at DESC"
         )
         rows = await cursor.fetchall()
-        inbounds = []
+        result = []
         for row in rows:
-            inbounds.append({
+            result.append({
                 "id": row["id"],
                 "inbound_id": row["inbound_id"],
                 "tag": row["tag"],
@@ -551,33 +494,22 @@ async def list_inbounds(request: Request):
                 "protocol": row["protocol"],
                 "uuid": row["uuid"],
                 "ws_path": row["ws_path"],
-                "ws_host": row["ws_host"],
                 "upstream_host": row["upstream_host"],
                 "upstream_port": row["upstream_port"],
-                "upstream_path": row["upstream_path"],
-                "upstream_tls": row["upstream_tls"],
-                "sni": row["sni"],
-                "alpn": row["alpn"],
-                "fingerprint": row["fingerprint"],
-                "public_key": row["public_key"],
-                "short_id": row["short_id"],
-                "spider_x": row["spider_x"],
-                "flow": row["flow"],
                 "total_upload": row["total_upload"],
                 "total_download": row["total_download"],
                 "enabled": bool(row["enabled"]),
-                "notes": row["notes"],
                 "created_at": row["created_at"],
                 "expires_at": row["expires_at"],
                 "last_used_at": row["last_used_at"],
             })
-        return {"success": True, "data": inbounds, "count": len(inbounds)}
+        return {"success": True, "data": result, "count": len(result)}
     finally:
         await db.close()
 
 
 @app.post("/api/inbounds")
-@limiter.limit("10/minute")
+@limiter.limit("20/minute")
 async def create_inbound(request: Request):
     """Create a new inbound."""
     try:
@@ -732,11 +664,9 @@ async def get_traffic_stats(request: Request):
     """Get traffic statistics."""
     db = await get_db()
     try:
-        # Global totals
         total_up = int(await get_setting(db, "total_global_upload", "0"))
         total_down = int(await get_setting(db, "total_global_download", "0"))
 
-        # Daily history
         cursor = await db.execute(
             """SELECT date, SUM(upload) as total_upload, SUM(download) as total_download
                FROM traffic_history
@@ -745,36 +675,15 @@ async def get_traffic_stats(request: Request):
                LIMIT ?""",
             (MAX_DAILY_TRAFFIC_HISTORY,),
         )
-        daily = []
-        async for row in cursor:
-            daily.append({
-                "date": row["date"],
-                "upload": row["total_upload"],
-                "download": row["total_download"],
-            })
-
-        # Per-inbound stats
-        cursor2 = await db.execute(
-            "SELECT inbound_id, tag, total_upload, total_download, enabled, last_used_at FROM inbounds ORDER BY total_download DESC"
-        )
-        per_inbound = []
-        async for row in cursor2:
-            per_inbound.append({
-                "inbound_id": row["inbound_id"],
-                "tag": row["tag"],
-                "upload": row["total_upload"],
-                "download": row["total_download"],
-                "enabled": bool(row["enabled"]),
-                "last_used": row["last_used_at"],
-            })
+        daily = [dict(row) for row in await cursor.fetchall()]
 
         return {
             "success": True,
             "data": {
-                "global_upload": total_up,
-                "global_download": total_down,
+                "total_upload": total_up,
+                "total_download": total_down,
+                "total_usage_gb": round((total_up + total_down) / (1024**3), 4),
                 "daily_history": daily,
-                "per_inbound": per_inbound,
             },
         }
     finally:
@@ -783,39 +692,31 @@ async def get_traffic_stats(request: Request):
 
 @app.get("/api/connections")
 @limiter.limit("30/minute")
-async def get_connection_logs(request: Request, limit: int = 50):
+async def get_connection_logs(
+    request: Request,
+    limit: int = Query(100, ge=1, le=500),
+):
     """Get recent connection logs."""
     db = await get_db()
     try:
         cursor = await db.execute(
-            """SELECT cl.*, i.tag
-               FROM connection_logs cl
-               LEFT JOIN inbounds i ON cl.inbound_id = i.inbound_id
-               ORDER BY cl.connected_at DESC
-               LIMIT ?""",
+            """SELECT * FROM connection_logs
+               ORDER BY connected_at DESC LIMIT ?""",
             (limit,),
         )
-        logs = []
-        async for row in cursor:
-            logs.append({
-                "id": row["id"],
-                "inbound_id": row["inbound_id"],
-                "tag": row["tag"] or "",
-                "client_ip": row["client_ip"],
-                "connected_at": row["connected_at"],
-                "disconnected_at": row["disconnected_at"],
-                "upload_bytes": row["upload_bytes"],
-                "download_bytes": row["download_bytes"],
-            })
-        return {"success": True, "data": logs, "count": len(logs)}
+        rows = await cursor.fetchall()
+        return {"success": True, "data": [dict(r) for r in rows]}
     finally:
         await db.close()
 
 
 @app.get("/api/export")
 @limiter.limit("10/minute")
-async def export_configs(request: Request, host: Optional[str] = Query(None)):
-    """Export all inbounds as JSON with VLESS URLs."""
+async def export_configs(
+    request: Request,
+    host: Optional[str] = Query(None),
+):
+    """Export all inbound configs as JSON."""
     db = await get_db()
     try:
         cursor = await db.execute("SELECT * FROM inbounds ORDER BY created_at DESC")
@@ -843,36 +744,17 @@ async def export_configs(request: Request, host: Optional[str] = Query(None)):
             configs.append({
                 "inbound_id": row["inbound_id"],
                 "tag": row["tag"],
-                "protocol": row["protocol"],
                 "uuid": row["uuid"],
-                "ws_path": row["ws_path"],
-                "host": request_host,
-                "port": row["port"],
-                "upstream_host": row["upstream_host"],
-                "upstream_port": row["upstream_port"],
-                "upstream_tls": row["upstream_tls"],
                 "vless_url": vless_url,
-                "created_at": row["created_at"],
-                "expires_at": row["expires_at"],
-                "total_upload": row["total_upload"],
-                "total_download": row["total_download"],
-                "notes": row["notes"],
+                "enabled": bool(row["enabled"]),
             })
-
-        export_data = {
-            "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-            "panel": "Luffy Panel v2.0.0",
-            "host": request_host,
-            "total_configs": len(configs),
-            "configs": configs,
-        }
-
-        return JSONResponse(
-            content=export_data,
-            headers={
-                "Content-Disposition": "attachment; filename=luffy-configs.json"
+        return {
+            "success": True,
+            "data": {
+                "inbounds": configs,
+                "export_time": datetime.now(timezone.utc).isoformat(),
             },
-        )
+        }
     finally:
         await db.close()
 
@@ -880,51 +762,50 @@ async def export_configs(request: Request, host: Optional[str] = Query(None)):
 @app.get("/api/stats")
 @limiter.limit("30/minute")
 async def get_system_stats(request: Request):
-    """Get system resource stats."""
-    import psutil
-
+    """Get system statistics."""
     try:
-        cpu = psutil.cpu_percent(interval=0.5)
+        import psutil
+        cpu = psutil.cpu_percent(interval=0.1)
         mem = psutil.virtual_memory()
         disk = psutil.disk_usage(DATA_DIR)
-        uptime = time.time() - psutil.boot_time()
+    except Exception:
+        cpu, mem, disk = 0, type('obj', (object,), {'percent': 0, 'used': 0, 'total': 0, 'free': 0})(), type('obj', (object,), {'percent': 0, 'free': 0})()
 
-        db = await get_db()
-        try:
-            c1 = await db.execute("SELECT COUNT(*) as c FROM inbounds")
-            inbound_count = (await c1.fetchone())["c"]
-            c2 = await db.execute("SELECT COUNT(*) as c FROM connection_logs")
-            connection_count = (await c2.fetchone())["c"]
-        finally:
-            await db.close()
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT COUNT(*) as c FROM inbounds WHERE enabled=1")
+        inbound_count = (await cursor.fetchone())["c"]
+        cursor = await db.execute("SELECT COUNT(*) as c FROM connection_logs")
+        conn_count = (await cursor.fetchone())["c"]
+        db_size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+    finally:
+        await db.close()
 
-        return {
-            "success": True,
-            "data": {
-                "cpu_percent": cpu,
-                "memory_percent": mem.percent,
-                "memory_used_gb": round(mem.used / (1024**3), 2),
-                "memory_total_gb": round(mem.total / (1024**3), 2),
-                "disk_percent": disk.percent,
-                "disk_free_gb": round(disk.free / (1024**3), 2),
-                "uptime_seconds": int(uptime),
-                "inbound_count": inbound_count,
-                "connection_count": connection_count,
-                "db_size_kb": round(os.path.getsize(DB_PATH) / 1024, 2) if os.path.exists(DB_PATH) else 0,
-                "python_version": os.sys.version,
-            },
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    return {
+        "success": True,
+        "data": {
+            "cpu_percent": cpu,
+            "memory_percent": mem.percent,
+            "memory_used_gb": round(mem.used / (1024**3), 2),
+            "memory_total_gb": round(mem.total / (1024**3), 2),
+            "disk_percent": disk.percent if hasattr(disk, 'percent') else 0,
+            "disk_free_gb": round(disk.free / (1024**3), 2) if hasattr(disk, 'free') else 0,
+            "uptime_seconds": int(time.time() - psutil.boot_time()) if 'psutil' in dir() else 0,
+            "inbound_count": inbound_count,
+            "connection_count": conn_count,
+            "db_size_kb": round(db_size / 1024, 1),
+            "python_version": os.popen("python3 --version").read().strip() if os.path.exists("/usr/bin/python3") else "unknown",
+        },
+    }
 
 
 # ═══════════════════════════════════════════════
-# WebSocket Proxy / Tunnel
+# WebSocket Proxy - VLESS over WS → TCP upstream
 # ═══════════════════════════════════════════════
 
 @app.websocket("/ws/{inbound_id}")
 async def websocket_proxy(websocket: WebSocket, inbound_id: str):
-    """Main VLESS-over-WebSocket proxy endpoint."""
+    """VLESS-over-WebSocket proxy: Client WS ↔ Xray TCP relay."""
     db = await get_db()
     try:
         cursor = await db.execute(
@@ -938,7 +819,6 @@ async def websocket_proxy(websocket: WebSocket, inbound_id: str):
         await websocket.close(code=4000, reason="Inbound not found")
         return
 
-    # Check expiration
     if inbound["expires_at"]:
         try:
             expires = datetime.fromisoformat(inbound["expires_at"].replace("Z", "+00:00"))
@@ -949,167 +829,65 @@ async def websocket_proxy(websocket: WebSocket, inbound_id: str):
             pass
 
     await websocket.accept()
-
     client_ip = websocket.client.host if websocket.client else ""
     upload_total = 0
     download_total = 0
-    upstream_ws = None
+
+    upstream_host = inbound["upstream_host"]
+    upstream_port = int(inbound["upstream_port"])
 
     try:
-        # Connect to upstream
-        upstream_url = (
-            f"{'wss' if inbound['upstream_tls'] == 'tls' else 'ws'}://"
-            f"{inbound['upstream_host']}:{inbound['upstream_port']}"
-            f"{inbound['upstream_path']}"
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(upstream_host, upstream_port),
+            timeout=10.0
         )
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-            async with client.stream(
-                "GET",
-                upstream_url.replace("ws://", "http://").replace("wss://", "https://"),
-                headers={
-                    "Upgrade": "websocket",
-                    "Connection": "Upgrade",
-                    "Sec-WebSocket-Version": "13",
-                    "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
-                    "Host": inbound["sni"] or inbound["upstream_host"],
-                },
-            ) as upstream_response:
-                if upstream_response.status_code not in (101, 200):
-                    await websocket.close(code=4002, reason="Upstream connection failed")
-                    return
-
-                # Bidirectional relay
-                async def client_to_upstream():
-                    nonlocal upload_total
-                    while True:
-                        try:
-                            data = await websocket.receive_bytes()
-                            upload_total += len(data)
-                            # Write to upstream via raw TCP-like relay
-                            # For WS-to-WS relay, we establish a separate WS connection
-                        except WebSocketDisconnect:
-                            break
-                        except Exception:
-                            break
-
-                async def upstream_to_client():
-                    nonlocal download_total
-                    try:
-                        async for chunk in upstream_response.aiter_bytes(8192):
-                            download_total += len(chunk)
-                            try:
-                                await websocket.send_bytes(chunk)
-                            except Exception:
-                                break
-                    except Exception:
-                        pass
-
-                # Run relay
-                relay_task = asyncio.create_task(upstream_to_client())
-                await client_to_upstream()
-                relay_task.cancel()
+        async def ws_to_tcp():
+            nonlocal upload_total
+            try:
+                while True:
+                    data = await websocket.receive_bytes()
+                    upload_total += len(data)
+                    writer.write(data)
+                    await writer.drain()
+            except WebSocketDisconnect:
+                pass
+            except Exception:
+                pass
+            finally:
                 try:
-                    await relay_task
-                except asyncio.CancelledError:
+                    writer.close()
+                except Exception:
                     pass
 
-    except Exception as e:
-        print(f"[WS Proxy] Error for {inbound_id}: {e}")
-    finally:
-        # Record traffic
-        if upload_total > 0 or download_total > 0:
+        async def tcp_to_ws():
+            nonlocal download_total
             try:
-                db = await get_db()
-                try:
-                    await record_traffic(db, inbound_id, upload_total, download_total)
-                    await log_connection(db, inbound_id, client_ip, upload_total, download_total)
-                finally:
-                    await db.close()
-            except Exception as e:
-                print(f"[WS Proxy] Failed to record traffic: {e}")
+                while True:
+                    chunk = await reader.read(65536)
+                    if not chunk:
+                        break
+                    download_total += len(chunk)
+                    await websocket.send_bytes(chunk)
+            except Exception:
+                pass
 
+        tcp_task = asyncio.create_task(tcp_to_ws())
+        await ws_to_tcp()
+        tcp_task.cancel()
         try:
-            await websocket.close()
-        except Exception:
+            await tcp_task
+        except asyncio.CancelledError:
             pass
 
-
-@app.websocket("/ws-raw/{inbound_id}")
-async def websocket_tunnel(websocket: WebSocket, inbound_id: str):
-    """Alternative raw WebSocket tunnel using httpx WebSocket."""
-    db = await get_db()
-    try:
-        cursor = await db.execute(
-            "SELECT * FROM inbounds WHERE inbound_id=? AND enabled=1", (inbound_id,)
-        )
-        inbound = await cursor.fetchone()
-    finally:
-        await db.close()
-
-    if not inbound:
-        await websocket.close(code=4000, reason="Inbound not found")
-        return
-
-    await websocket.accept()
-    client_ip = websocket.client.host if websocket.client else ""
-    upload_total = 0
-    download_total = 0
-
-    upstream_url = (
-        f"{'wss' if inbound['upstream_tls'] == 'tls' else 'ws'}://"
-        f"{inbound['upstream_host']}:{inbound['upstream_port']}"
-        f"{inbound['upstream_path']}"
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-            async with client.stream("GET", upstream_url.replace("ws://", "http://").replace("wss://", "https://"),
-                headers={
-                    "Upgrade": "websocket",
-                    "Connection": "Upgrade",
-                    "Sec-WebSocket-Version": "13",
-                    "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
-                    "Host": inbound["sni"] or inbound["upstream_host"],
-                }) as up_resp:
-
-                if up_resp.status_code not in (101, 200):
-                    await websocket.close(code=4002)
-                    return
-
-                async def relay_c2u():
-                    nonlocal upload_total
-                    try:
-                        while True:
-                            data = await websocket.receive_bytes()
-                            upload_total += len(data)
-                    except WebSocketDisconnect:
-                        pass
-                    except Exception:
-                        pass
-
-                async def relay_u2c():
-                    nonlocal download_total
-                    try:
-                        async for chunk in up_resp.aiter_bytes(65536):
-                            download_total += len(chunk)
-                            try:
-                                await websocket.send_bytes(chunk)
-                            except Exception:
-                                break
-                    except Exception:
-                        pass
-
-                task = asyncio.create_task(relay_u2c())
-                await relay_c2u()
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
+    except asyncio.TimeoutError:
+        logging.warning(f"[Proxy] Timeout connecting to {upstream_host}:{upstream_port}")
+        await websocket.close(code=4003, reason="Upstream timeout")
+    except ConnectionRefusedError:
+        logging.error(f"[Proxy] Xray not running on {upstream_host}:{upstream_port}")
+        await websocket.close(code=4004, reason="Upstream unavailable")
     except Exception as e:
-        print(f"[WS Tunnel] Error for {inbound_id}: {e}")
+        logging.error(f"[Proxy] Error for {inbound_id}: {e}")
     finally:
         if upload_total > 0 or download_total > 0:
             try:
@@ -1120,7 +898,7 @@ async def websocket_tunnel(websocket: WebSocket, inbound_id: str):
                 finally:
                     await db.close()
             except Exception as e:
-                print(f"[WS Tunnel] Failed to record traffic: {e}")
+                logging.error(f"[Proxy] Failed to record traffic: {e}")
         try:
             await websocket.close()
         except Exception:
@@ -1128,7 +906,31 @@ async def websocket_tunnel(websocket: WebSocket, inbound_id: str):
 
 
 # ═══════════════════════════════════════════════
-# HTML Dashboard
+# Health & Ping
+# ═══════════════════════════════════════════════
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    db_ok = os.path.exists(DB_PATH)
+    xray_status = "running" if XRAY_ENABLED else "disabled"
+    return {
+        "status": "healthy" if db_ok else "degraded",
+        "version": "2.1.0",
+        "database": "connected" if db_ok else "disconnected",
+        "xray": xray_status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/ping")
+async def ping():
+    """Simple ping endpoint."""
+    return {"ping": "pong", "timestamp": int(time.time())}
+
+
+# ═══════════════════════════════════════════════
+# Dashboard HTML
 # ═══════════════════════════════════════════════
 
 @app.get("/", response_class=HTMLResponse)
@@ -1151,82 +953,41 @@ DASHBOARD_HTML = r"""
     <title>🌊 Luffy Panel</title>
     <style>
         :root {
-            --bg: #f0f4f8;
-            --bg-card: #ffffff;
-            --bg-input: #f8fafc;
-            --text: #1a202c;
-            --text-secondary: #64748b;
-            --border: #e2e8f0;
-            --primary: #3b82f6;
-            --primary-hover: #2563eb;
-            --danger: #ef4444;
-            --danger-hover: #dc2626;
-            --success: #22c55e;
-            --success-bg: #dcfce7;
-            --warning: #f59e0b;
-            --warning-bg: #fef3c7;
-            --shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);
-            --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px rgba(0,0,0,0.05);
-            --radius: 12px;
-            --transition: 0.2s ease;
+            --bg: #f0f2f5;
+            --bg-card: #fff;
+            --text: #1a1a2e;
+            --text-secondary: #666;
+            --primary: #e74c3c;
+            --primary-hover: #c0392b;
+            --accent: #e74c3c;
+            --border: #e0e0e0;
+            --success: #27ae60;
+            --warning: #f39c12;
+            --danger: #e74c3c;
+            --shadow: 0 1px 3px rgba(0,0,0,0.08);
         }
         @media (prefers-color-scheme: dark) {
             :root {
-                --bg: #0f172a;
-                --bg-card: #1e293b;
-                --bg-input: #334155;
-                --text: #e2e8f0;
-                --text-secondary: #94a3b8;
-                --border: #334155;
-                --primary: #60a5fa;
-                --primary-hover: #3b82f6;
-                --danger: #f87171;
-                --danger-hover: #ef4444;
-                --success: #4ade80;
-                --success-bg: #14532d;
-                --warning: #fbbf24;
-                --warning-bg: #422006;
-                --shadow: 0 1px 3px rgba(0,0,0,0.3), 0 1px 2px rgba(0,0,0,0.2);
-                --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.4), 0 4px 6px rgba(0,0,0,0.3);
+                --bg: #0d1117;
+                --bg-card: #161b22;
+                --text: #e6edf3;
+                --text-secondary: #8b949e;
+                --border: #30363d;
+                --shadow: 0 1px 3px rgba(0,0,0,0.3);
             }
         }
-        [data-theme="light"] {
-            --bg: #f0f4f8; --bg-card: #ffffff; --bg-input: #f8fafc;
-            --text: #1a202c; --text-secondary: #64748b; --border: #e2e8f0;
-            --primary: #3b82f6; --primary-hover: #2563eb; --danger: #ef4444;
-            --danger-hover: #dc2626; --success: #22c55e; --success-bg: #dcfce7;
-            --warning: #f59e0b; --warning-bg: #fef3c7;
-            --shadow: 0 1px 3px rgba(0,0,0,0.1); --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.1);
-        }
-        [data-theme="dark"] {
-            --bg: #0f172a; --bg-card: #1e293b; --bg-input: #334155;
-            --text: #e2e8f0; --text-secondary: #94a3b8; --border: #334155;
-            --primary: #60a5fa; --primary-hover: #3b82f6; --danger: #f87171;
-            --danger-hover: #ef4444; --success: #4ade80; --success-bg: #14532d;
-            --warning: #fbbf24; --warning-bg: #422006;
-            --shadow: 0 1px 3px rgba(0,0,0,0.3); --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.4);
-        }
-
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: var(--bg);
             color: var(--text);
             min-height: 100vh;
-            line-height: 1.6;
-            transition: background var(--transition), color var(--transition);
         }
-
-        .container { max-width: 1200px; margin: 0 auto; padding: 16px; }
-
-        /* Header */
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
         header {
             background: var(--bg-card);
             border-bottom: 1px solid var(--border);
             padding: 16px 24px;
-            position: sticky;
-            top: 0;
-            z-index: 100;
             box-shadow: var(--shadow);
             display: flex;
             justify-content: space-between;
@@ -1234,894 +995,290 @@ DASHBOARD_HTML = r"""
             flex-wrap: wrap;
             gap: 12px;
         }
-        header h1 { font-size: 1.5rem; display: flex; align-items: center; gap: 8px; }
-        .header-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-
-        /* Buttons */
-        .btn {
-            display: inline-flex; align-items: center; gap: 6px;
-            padding: 8px 16px; border: none; border-radius: 8px;
-            cursor: pointer; font-size: 0.875rem; font-weight: 500;
-            transition: all var(--transition); text-decoration: none;
-            white-space: nowrap;
-        }
-        .btn-primary { background: var(--primary); color: #fff; }
-        .btn-primary:hover { background: var(--primary-hover); transform: translateY(-1px); }
-        .btn-danger { background: var(--danger); color: #fff; }
-        .btn-danger:hover { background: var(--danger-hover); }
-        .btn-outline {
-            background: transparent; border: 1px solid var(--border); color: var(--text);
-        }
-        .btn-outline:hover { background: var(--bg-input); }
-        .btn-sm { padding: 4px 10px; font-size: 0.75rem; }
-        .btn-icon { padding: 6px 8px; min-width: 32px; justify-content: center; }
-
-        /* Theme toggle */
-        .theme-toggle {
-            background: var(--bg-input); border: 1px solid var(--border);
-            border-radius: 20px; padding: 6px; cursor: pointer;
-            display: flex; align-items: center; gap: 4px;
-            font-size: 1.1rem; color: var(--text);
-            transition: all var(--transition);
-        }
-        .theme-toggle:hover { background: var(--border); }
-
-        /* Cards */
-        .card {
-            background: var(--bg-card); border: 1px solid var(--border);
-            border-radius: var(--radius); padding: 20px;
-            box-shadow: var(--shadow); transition: all var(--transition);
-            margin-bottom: 16px;
-        }
-        .card-header {
-            display: flex; justify-content: space-between; align-items: center;
-            margin-bottom: 16px; flex-wrap: wrap; gap: 8px;
-        }
-        .card-title { font-size: 1.1rem; font-weight: 600; }
-
-        /* Stats grid */
+        header h1 { font-size: 1.5rem; color: var(--primary); }
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 12px;
-            margin-bottom: 20px;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin: 20px 0;
         }
         .stat-card {
-            background: var(--bg-card); border: 1px solid var(--border);
-            border-radius: var(--radius); padding: 16px;
-            text-align: center; box-shadow: var(--shadow);
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            box-shadow: var(--shadow);
         }
-        .stat-value { font-size: 1.5rem; font-weight: 700; color: var(--primary); }
-        .stat-label { font-size: 0.75rem; color: var(--text-secondary); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
-
-        /* Forms */
-        .form-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 12px;
+        .stat-card .label { font-size: 0.8rem; color: var(--text-secondary); text-transform: uppercase; }
+        .stat-card .value { font-size: 1.8rem; font-weight: 700; margin-top: 4px; }
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            box-shadow: var(--shadow);
         }
-        .form-group { display: flex; flex-direction: column; gap: 4px; }
-        .form-group label { font-size: 0.8rem; font-weight: 500; color: var(--text-secondary); }
-        .form-group input, .form-group select, .form-group textarea {
-            padding: 8px 12px; border: 1px solid var(--border);
-            border-radius: 8px; background: var(--bg-input); color: var(--text);
-            font-size: 0.875rem; transition: border var(--transition);
-            font-family: inherit;
+        .card h2 { font-size: 1.1rem; margin-bottom: 16px; color: var(--primary); }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px 8px; text-align: left; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+        th { color: var(--text-secondary); font-weight: 600; text-transform: uppercase; font-size: 0.75rem; }
+        .text-mono { font-family: 'Courier New', monospace; font-size: 0.8rem; word-break: break-all; }
+        button, .btn {
+            background: var(--primary);
+            color: #fff;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-weight: 500;
+            transition: background 0.2s;
         }
-        .form-group input:focus, .form-group select:focus, .form-group textarea:focus {
-            outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(59,130,246,0.1);
+        button:hover { background: var(--primary-hover); }
+        button.danger { background: var(--danger); }
+        button.secondary { background: var(--text-secondary); }
+        input, select {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            width: 100%;
+            margin: 4px 0 12px;
         }
-        .form-group textarea { resize: vertical; min-height: 60px; }
-        .form-full { grid-column: 1 / -1; }
-
-        /* Table */
-        .table-container { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-        table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-        th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }
-        th { font-weight: 600; color: var(--text-secondary); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
-        tr:hover { background: var(--bg-input); }
-        .text-mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.8rem; }
-        .text-truncate { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-        /* Badge */
-        .badge {
-            display: inline-block; padding: 2px 8px; border-radius: 12px;
-            font-size: 0.7rem; font-weight: 600; text-transform: uppercase;
-        }
-        .badge-active { background: var(--success-bg); color: var(--success); }
-        .badge-expired { background: var(--warning-bg); color: var(--warning); }
-        .badge-disabled { background: var(--bg-input); color: var(--text-secondary); }
-
-        /* Tabs */
-        .tabs { display: flex; gap: 4px; border-bottom: 2px solid var(--border); margin-bottom: 16px; overflow-x: auto; }
-        .tab {
-            padding: 8px 16px; cursor: pointer; border: none; background: none;
-            color: var(--text-secondary); font-size: 0.875rem; font-weight: 500;
-            border-bottom: 2px solid transparent; margin-bottom: -2px;
-            transition: all var(--transition); white-space: nowrap;
-        }
-        .tab:hover { color: var(--text); }
-        .tab.active { color: var(--primary); border-bottom-color: var(--primary); }
-        .tab-content { display: none; }
-        .tab-content.active { display: block; }
-
-        /* Modal */
-        .modal-overlay {
-            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0,0,0,0.5); z-index: 200; align-items: center; justify-content: center;
-        }
-        .modal-overlay.active { display: flex; }
-        .modal {
-            background: var(--bg-card); border-radius: var(--radius);
-            padding: 24px; max-width: 600px; width: 90%; max-height: 90vh;
-            overflow-y: auto; box-shadow: var(--shadow-lg);
-        }
-        .modal h3 { margin-bottom: 16px; }
-        .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
-
-        /* QR */
-        .qr-container { text-align: center; padding: 16px; }
-        .qr-container canvas, .qr-container img { max-width: 200px; border-radius: 8px; }
-
-        /* Toast */
-        .toast-container {
-            position: fixed; bottom: 20px; right: 20px; z-index: 300;
-            display: flex; flex-direction: column; gap: 8px;
-        }
-        .toast {
-            padding: 12px 20px; border-radius: 8px; color: #fff;
-            font-size: 0.875rem; box-shadow: var(--shadow-lg);
-            animation: slideIn 0.3s ease; cursor: pointer;
-            white-space: nowrap;
-        }
-        .toast-success { background: var(--success); }
-        .toast-error { background: var(--danger); }
-        .toast-info { background: var(--primary); }
-        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
-
-        /* Chart placeholder */
-        .chart-bar {
-            display: flex; align-items: flex-end; gap: 4px; height: 120px;
-            padding: 8px 0;
-        }
-        .chart-bar-item {
-            flex: 1; background: var(--primary); border-radius: 4px 4px 0 0;
-            min-height: 2px; opacity: 0.8; transition: opacity var(--transition);
-            position: relative;
-        }
-        .chart-bar-item:hover { opacity: 1; }
-        .chart-labels { display: flex; gap: 4px; font-size: 0.65rem; color: var(--text-secondary); }
-        .chart-labels span { flex: 1; text-align: center; overflow: hidden; text-overflow: ellipsis; }
-
-        /* Copy button feedback */
-        .copied { animation: pulse 0.3s ease; }
-        @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.05); } }
-
-        /* Mobile */
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
         @media (max-width: 768px) {
-            .container { padding: 8px; }
-            header { padding: 12px 16px; }
-            header h1 { font-size: 1.2rem; }
-            .card { padding: 12px; }
-            .form-grid { grid-template-columns: 1fr; }
-            .stats-grid { grid-template-columns: repeat(2, 1fr); }
-            th, td { padding: 8px 6px; font-size: 0.75rem; }
-            .modal { width: 95%; padding: 16px; }
-            .text-truncate { max-width: 100px; }
-            .hide-mobile { display: none; }
+            .form-row { grid-template-columns: 1fr; }
+            .stats-grid { grid-template-columns: 1fr 1fr; }
         }
-
-        /* RTL support */
-        [dir="rtl"] th, [dir="rtl"] td { text-align: right; }
-        [dir="rtl"] .header-actions { flex-direction: row-reverse; }
-        [dir="rtl"] .btn { flex-direction: row-reverse; }
-
-        /* Loading spinner */
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.7rem;
+            font-weight: 600;
+        }
+        .badge-active { background: var(--success); color: #fff; }
+        .badge-inactive { background: var(--text-secondary); color: #fff; }
+        .empty-state { text-align: center; padding: 40px; color: var(--text-secondary); }
+        .toast {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: var(--success);
+            color: #fff;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: 500;
+            z-index: 9999;
+            animation: fadeIn 0.3s;
+        }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
         .spinner {
-            display: inline-block; width: 20px; height: 20px; border: 2px solid var(--border);
+            width: 30px; height: 30px;
+            border: 3px solid var(--border);
             border-top-color: var(--primary); border-radius: 50%; animation: spin 0.6s linear infinite;
+            margin: 20px auto;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
-
-        .empty-state { text-align: center; padding: 40px 20px; color: var(--text-secondary); }
-        .empty-state .icon { font-size: 3rem; margin-bottom: 12px; }
+        .qrcode-container { text-align: center; margin: 16px 0; }
+        #qrcode-modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 9999; align-items: center; justify-content: center; }
+        #qrcode-modal.show { display: flex; }
+        #qrcode-modal .modal-content { background: var(--bg-card); padding: 24px; border-radius: 12px; text-align: center; max-width: 400px; }
     </style>
 </head>
 <body>
+    <header>
+        <h1>🏴‍☠️ Luffy Panel</h1>
+        <div>
+            <button onclick="refreshAll()">🔄 Refresh</button>
+            <button onclick="showCreateForm()" style="margin-left:8px">➕ New Inbound</button>
+            <button onclick="exportConfigs()" class="secondary" style="margin-left:8px">📥 Export</button>
+        </div>
+    </header>
 
-<header>
-    <h1>🌊 Luffy Panel <span style="font-size:0.7rem;color:var(--text-secondary);font-weight:400;">v2.0</span></h1>
-    <div class="header-actions">
-        <button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme" id="themeToggle">🌓</button>
-        <button class="btn btn-outline btn-sm" onclick="refreshAll()">🔄 Refresh</button>
-        <button class="btn btn-primary btn-sm" onclick="openAddModal()">➕ Add Inbound</button>
-        <button class="btn btn-outline btn-sm" onclick="exportConfigs()">📤 Export</button>
-    </div>
-</header>
-
-<div class="container">
-    <!-- Stats -->
-    <div class="stats-grid" id="statsGrid">
-        <div class="stat-card"><div class="stat-value" id="statInbounds">—</div><div class="stat-label" data-en="Active Inbounds" data-fa="اینباندهای فعال">Active Inbounds</div></div>
-        <div class="stat-card"><div class="stat-value" id="statUpload">—</div><div class="stat-label" data-en="Total Upload" data-fa="آپلود کل">Total Upload</div></div>
-        <div class="stat-card"><div class="stat-value" id="statDownload">—</div><div class="stat-label" data-en="Total Download" data-fa="دانلود کل">Total Download</div></div>
-        <div class="stat-card"><div class="stat-value" id="statConnections">—</div><div class="stat-label" data-en="Connections" data-fa="اتصالات">Connections</div></div>
-    </div>
-
-    <!-- Tabs -->
-    <div class="card">
-        <div class="tabs">
-            <button class="tab active" onclick="switchTab('inbounds')" data-en="Inbounds" data-fa="اینباندها">Inbounds</button>
-            <button class="tab" onclick="switchTab('traffic')" data-en="Traffic Chart" data-fa="نمودار ترافیک">Traffic Chart</button>
-            <button class="tab" onclick="switchTab('connections')" data-en="Connection Logs" data-fa="لاگ اتصالات">Connection Logs</button>
-            <button class="tab" onclick="switchTab('system')" data-en="System" data-fa="سیستم">System</button>
+    <div class="container">
+        <div class="stats-grid" id="stats-grid">
+            <div class="stat-card"><div class="label">Active Inbounds</div><div class="value" id="stat-inbounds">-</div></div>
+            <div class="stat-card"><div class="label">Connections</div><div class="value" id="stat-connections">-</div></div>
+            <div class="stat-card"><div class="label">Total Traffic</div><div class="value" id="stat-traffic">-</div></div>
+            <div class="stat-card"><div class="label">CPU / Memory</div><div class="value" id="stat-cpu">-</div></div>
         </div>
 
-        <!-- Inbounds Tab -->
-        <div class="tab-content active" id="tab-inbounds">
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th data-en="Tag" data-fa="برچسب">Tag</th>
-                            <th class="hide-mobile" data-en="UUID" data-fa="UUID">UUID (Short)</th>
-                            <th data-en="WS Path" data-fa="مسیر WS">WS Path</th>
-                            <th class="hide-mobile" data-en="Traffic" data-fa="ترافیک">Traffic</th>
-                            <th data-en="Status" data-fa="وضعیت">Status</th>
-                            <th data-en="Actions" data-fa="عملیات">Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody id="inboundsTableBody">
-                        <tr><td colspan="6" class="empty-state"><div class="spinner"></div><br>Loading...</td></tr>
-                    </tbody>
-                </table>
+        <div class="card">
+            <h2>📡 Inbounds</h2>
+            <table>
+                <thead>
+                    <tr><th>Tag</th><th>UUID</th><th>Path</th><th>Upstream</th><th>Traffic</th><th>Actions</th></tr>
+                </thead>
+                <tbody id="inbounds-table">
+                    <tr><td colspan="6" class="empty-state"><div class="spinner"></div><br>Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="card" id="create-card" style="display:none">
+            <h2>➕ Create Inbound</h2>
+            <form id="create-form" onsubmit="createInbound(event)">
+                <div class="form-row">
+                    <div><label>Label</label><input name="label" placeholder="My VPN" required></div>
+                    <div><label>Upstream Host</label><input name="upstream_host" placeholder="127.0.0.1 (default: Xray)"></div>
+                </div>
+                <div class="form-row">
+                    <div><label>Upstream Port</label><input name="upstream_port" type="number" value="10000"></div>
+                    <div><label>WS Path</label><input name="ws_path" value="/ws"></div>
+                </div>
+                <div class="form-row">
+                    <div><label>Data Limit (GB)</label><input name="limit_value" type="number" value="0" placeholder="0 = unlimited"></div>
+                    <div><label>Max Connections</label><input name="max_connections" type="number" value="0" placeholder="0 = unlimited"></div>
+                </div>
+                <div class="form-row">
+                    <div><label>SNI</label><input name="sni" placeholder="Auto"></div>
+                    <div><label>Expires (days)</label><input name="expires_in_days" type="number" placeholder="0 = never"></div>
+                </div>
+                <div style="margin-top:12px">
+                    <button type="submit">✅ Create</button>
+                    <button type="button" class="secondary" onclick="document.getElementById('create-card').style.display='none'">Cancel</button>
+                </div>
+            </form>
+        </div>
+
+        <div class="card" id="qrcode-modal">
+            <div class="modal-content">
+                <h3>📱 QR Code</h3>
+                <div id="qrcode-container" class="qrcode-container"></div>
+                <button class="secondary" onclick="hideQR()" style="margin-top:12px">Close</button>
             </div>
         </div>
-
-        <!-- Traffic Tab -->
-        <div class="tab-content" id="tab-traffic">
-            <div class="chart-bar" id="trafficChart"></div>
-            <div class="chart-labels" id="trafficChartLabels"></div>
-        </div>
-
-        <!-- Connections Tab -->
-        <div class="tab-content" id="tab-connections">
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th data-en="Time" data-fa="زمان">Time</th>
-                            <th data-en="Tag" data-fa="برچسب">Tag</th>
-                            <th data-en="Upload" data-fa="آپلود">Upload</th>
-                            <th data-en="Download" data-fa="دانلود">Download</th>
-                            <th class="hide-mobile" data-en="Client IP" data-fa="IP کلاینت">Client IP</th>
-                        </tr>
-                    </thead>
-                    <tbody id="connectionsTableBody">
-                        <tr><td colspan="5" class="empty-state"><div class="spinner"></div><br>Loading...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
-        <!-- System Tab -->
-        <div class="tab-content" id="tab-system">
-            <div class="stats-grid" id="systemStatsGrid"></div>
-        </div>
     </div>
-</div>
 
-<!-- Add/Edit Modal -->
-<div class="modal-overlay" id="addModal">
-    <div class="modal">
-        <h3 data-en="Add New Inbound" data-fa="افزودن اینباند جدید">Add New Inbound</h3>
-        <form id="addForm" onsubmit="submitInbound(event)">
-            <div class="form-grid">
-                <div class="form-group">
-                    <label data-en="Tag (Name)" data-fa="برچسب (نام)">Tag (Name)</label>
-                    <input type="text" name="tag" placeholder="My Server" id="fieldTag">
-                </div>
-                <div class="form-group">
-                    <label data-en="Port" data-fa="پورت">Port</label>
-                    <input type="number" name="port" value="443" id="fieldPort">
-                </div>
-                <div class="form-group">
-                    <label data-en="UUID (or leave empty to generate)" data-fa="UUID (خالی بگذارید تا ساخته شود)">UUID</label>
-                    <input type="text" name="uuid" placeholder="Auto-generated" id="fieldUUID">
-                </div>
-                <div class="form-group">
-                    <label data-en="WebSocket Path" data-fa="مسیر WebSocket">WS Path</label>
-                    <input type="text" name="ws_path" value="/ws" id="fieldWSPath">
-                </div>
-                <div class="form-group">
-                    <label data-en="WS Host Header (optional)" data-fa="هدر Host (اختیاری)">WS Host</label>
-                    <input type="text" name="ws_host" placeholder="" id="fieldWSHost">
-                </div>
-                <div class="form-group">
-                    <label data-en="Upstream Host *" data-fa="هاست آپ‌استریم *">Upstream Host *</label>
-                    <input type="text" name="upstream_host" placeholder="example.com" required id="fieldUpstreamHost">
-                </div>
-                <div class="form-group">
-                    <label data-en="Upstream Port" data-fa="پورت آپ‌استریم">Upstream Port</label>
-                    <input type="number" name="upstream_port" value="443" id="fieldUpstreamPort">
-                </div>
-                <div class="form-group">
-                    <label data-en="Upstream Path" data-fa="مسیر آپ‌استریم">Upstream Path</label>
-                    <input type="text" name="upstream_path" value="/" id="fieldUpstreamPath">
-                </div>
-                <div class="form-group">
-                    <label data-en="TLS" data-fa="TLS">TLS</label>
-                    <select name="upstream_tls" id="fieldTLS">
-                        <option value="tls">TLS</option>
-                        <option value="none">None</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label data-en="SNI" data-fa="SNI">SNI</label>
-                    <input type="text" name="sni" placeholder="Same as host" id="fieldSNI">
-                </div>
-                <div class="form-group">
-                    <label data-en="Fingerprint" data-fa="اثر انگشت">Fingerprint</label>
-                    <select name="fingerprint" id="fieldFingerprint">
-                        <option value="chrome">Chrome</option>
-                        <option value="firefox">Firefox</option>
-                        <option value="safari">Safari</option>
-                        <option value="randomized">Randomized</option>
-                        <option value="ios">iOS</option>
-                        <option value="android">Android</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label data-en="Flow" data-fa="Flow">Flow</label>
-                    <select name="flow" id="fieldFlow">
-                        <option value="">None</option>
-                        <option value="xtls-rprx-vision">XTLS Vision</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label data-en="Expires In (days, optional)" data-fa="انقضا (روز، اختیاری)">Expires In (days)</label>
-                    <input type="number" name="expires_in_days" placeholder="Never" id="fieldExpires">
-                </div>
-                <div class="form-group form-full">
-                    <label data-en="Notes" data-fa="یادداشت">Notes</label>
-                    <textarea name="notes" placeholder="Optional notes..." id="fieldNotes"></textarea>
-                </div>
-            </div>
-            <div class="modal-actions">
-                <button type="button" class="btn btn-outline" onclick="closeAddModal()" data-en="Cancel" data-fa="لغو">Cancel</button>
-                <button type="submit" class="btn btn-primary" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</button>
-            </div>
-        </form>
-    </div>
-</div>
+    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+    <script>
+        const BASE_URL = '__BASE_URL__';
 
-<!-- QR Modal -->
-<div class="modal-overlay" id="qrModal">
-    <div class="modal">
-        <h3 data-en="VLESS Config" data-fa="کانفیگ VLESS">VLESS Config</h3>
-        <div class="qr-container">
-            <div id="qrCodeContainer"></div>
-        </div>
-        <div style="margin-top:12px">
-            <label style="font-size:0.8rem;color:var(--text-secondary);" data-en="VLESS URL (click to copy):" data-fa="لینک VLESS (کلیک کنید تا کپی شود):">VLESS URL:</label>
-            <input type="text" id="vlessUrlDisplay" readonly
-                   style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-input);color:var(--text);font-family:monospace;font-size:0.75rem;cursor:pointer;margin-top:4px;"
-                   onclick="copyVlessUrl()" data-en="Click to copy" data-fa="کلیک برای کپی">
-        </div>
-        <div class="modal-actions">
-            <button class="btn btn-outline btn-sm" onclick="copyVlessUrl()">📋 <span data-en="Copy" data-fa="کپی">Copy</span></button>
-            <button class="btn btn-outline btn-sm" onclick="downloadQR()">💾 <span data-en="Save QR" data-fa="ذخیره QR">Save QR</span></button>
-            <button class="btn btn-outline" onclick="closeQrModal()" data-en="Close" data-fa="بستن">Close</button>
-        </div>
-    </div>
-</div>
-
-<!-- Toast container -->
-<div class="toast-container" id="toastContainer"></div>
-
-<!-- Scripts -->
-<script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
-<script>
-// ═══════════════════════════════════════
-// State & Configuration
-// ═══════════════════════════════════════
-const BASE_URL = '__BASE_URL__';
-let currentTheme = localStorage.getItem('luffy-theme') || 'auto';
-let currentLang = localStorage.getItem('luffy-lang') || 'en';
-let currentVlessUrl = '';
-let activeTab = 'inbounds';
-let refreshTimer = null;
-
-// ═══════════════════════════════════════
-// Theme Management
-// ═══════════════════════════════════════
-function applyTheme(theme) {
-    if (theme === 'auto') {
-        document.documentElement.removeAttribute('data-theme');
-    } else {
-        document.documentElement.setAttribute('data-theme', theme);
-    }
-    currentTheme = theme;
-    localStorage.setItem('luffy-theme', theme);
-    updateThemeIcon();
-}
-
-function toggleTheme() {
-    const themes = ['auto', 'light', 'dark'];
-    const idx = themes.indexOf(currentTheme);
-    const next = themes[(idx + 1) % themes.length];
-    applyTheme(next);
-    showToast('Theme: ' + next, 'info');
-}
-
-function updateThemeIcon() {
-    const icons = { auto: '🌓', light: '☀️', dark: '🌙' };
-    document.getElementById('themeToggle').textContent = icons[currentTheme] || '🌓';
-}
-
-// Listen for system theme changes
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-    if (currentTheme === 'auto') applyTheme('auto');
-});
-
-// ═══════════════════════════════════════
-// Language Support
-// ═══════════════════════════════════════
-function t(key, lang) {
-    const el = document.querySelector(`[data-${lang}]`);
-    return el ? el.getAttribute(`data-${lang}`) : key;
-}
-
-function updateLanguage(lang) {
-    currentLang = lang;
-    localStorage.setItem('luffy-lang', lang);
-    document.querySelectorAll('[data-en][data-fa]').forEach(el => {
-        // Keep original text; for now just update dir
-    });
-    document.documentElement.dir = lang === 'fa' ? 'rtl' : 'ltr';
-    document.documentElement.lang = lang === 'fa' ? 'fa' : 'en';
-}
-
-// ═══════════════════════════════════════
-// Toast Notifications
-// ═══════════════════════════════════════
-function showToast(msg, type = 'info') {
-    const container = document.getElementById('toastContainer');
-    const toast = document.createElement('div');
-    toast.className = `toast toast-${type}`;
-    toast.textContent = msg;
-    toast.onclick = () => toast.remove();
-    container.appendChild(toast);
-    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 4000);
-}
-
-// ═══════════════════════════════════════
-// Tab Switching
-// ═══════════════════════════════════════
-function switchTab(tabName) {
-    activeTab = tabName;
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-    document.querySelector(`[onclick="switchTab('${tabName}')"]`).classList.add('active');
-    document.getElementById(`tab-${tabName}`).classList.add('active');
-
-    if (tabName === 'traffic') loadTrafficChart();
-    else if (tabName === 'connections') loadConnections();
-    else if (tabName === 'system') loadSystemStats();
-    else loadInbounds();
-}
-
-// ═══════════════════════════════════════
-// API Helpers
-// ═══════════════════════════════════════
-async function api(url, options = {}) {
-    try {
-        const res = await fetch(BASE_URL + url, {
-            headers: { 'Content-Type': 'application/json', ...options.headers },
-            ...options
-        });
-        if (!res.ok) {
-            const err = await res.text();
-            throw new Error(err || `HTTP ${res.status}`);
+        async function api(url, opts = {}) {
+            const res = await fetch(BASE_URL + url, {
+                headers: { 'Content-Type': 'application/json', ...opts.headers },
+                ...opts,
+            });
+            return res.json();
         }
-        return await res.json();
-    } catch (err) {
-        showToast('Error: ' + err.message, 'error');
-        throw err;
-    }
-}
 
-// ═══════════════════════════════════════
-// Load Data
-// ═══════════════════════════════════════
-async function loadInbounds() {
-    try {
-        const data = await api('/api/inbounds');
-        const tbody = document.getElementById('inboundsTableBody');
-        if (!data.data || data.data.length === 0) {
-            tbody.innerHTML = `<tr><td colspan="6" class="empty-state"><div class="icon">📭</div><p>No inbounds yet. Click "Add Inbound" to create one.</p></td></tr>`;
-        } else {
-            tbody.innerHTML = data.data.map(ib => {
-                const shortUUID = ib.uuid ? ib.uuid.substring(0, 12) + '...' : '—';
-                const traffic = formatBytes(ib.total_upload + ib.total_download);
-                const created = formatDate(ib.created_at);
-                const isExpired = ib.expires_at && new Date(ib.expires_at + 'Z') < new Date();
-                const statusClass = !ib.enabled ? 'badge-disabled' : (isExpired ? 'badge-expired' : 'badge-active');
-                const statusText = !ib.enabled ? 'Disabled' : (isExpired ? 'Expired' : 'Active');
-                return `<tr>
-                    <td><strong>${escHtml(ib.tag || '—')}</strong><br><small class="text-mono">${ib.inbound_id}</small></td>
-                    <td class="hide-mobile text-mono text-truncate" title="${ib.uuid}">${shortUUID}</td>
-                    <td class="text-mono">${escHtml(ib.ws_path)}</td>
-                    <td class="hide-mobile">${traffic}<br><small style="color:var(--text-secondary)">${created}</small></td>
-                    <td><span class="badge ${statusClass}">${statusText}</span></td>
-                    <td>
-                        <button class="btn btn-primary btn-sm" onclick="showQR('${ib.inbound_id}')">📷 QR</button>
-                        <button class="btn btn-outline btn-sm" onclick="copyLink('${ib.inbound_id}')">📋</button>
-                        <button class="btn btn-danger btn-sm" onclick="deleteInbound('${ib.inbound_id}')">🗑</button>
-                    </td>
-                </tr>`;
-            }).join('');
-        }
-    } catch (err) {
-        console.error('Failed to load inbounds', err);
-    }
-}
+        function escHtml(s) { return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+        function fmtBytes(b) { return b > 1e9 ? (b/1e9).toFixed(2)+' GB' : b > 1e6 ? (b/1e6).toFixed(1)+' MB' : (b/1024).toFixed(1)+' KB'; }
 
-async function loadStats() {
-    try {
-        const data = await api('/api/traffic');
-        if (data.success) {
-            document.getElementById('statUpload').textContent = formatBytes(data.data.global_upload);
-            document.getElementById('statDownload').textContent = formatBytes(data.data.global_download);
-            document.getElementById('statInbounds').textContent = data.data.per_inbound.filter(i => i.enabled).length;
-        }
-        const conns = await api('/api/connections?limit=1');
-        document.getElementById('statConnections').textContent = conns.count || 0;
-    } catch (err) {
-        console.error('Failed to load stats', err);
-    }
-}
+        async function refreshAll() {
+            const [inbounds, stats] = await Promise.all([
+                api('/api/inbounds'),
+                api('/api/stats'),
+            ]);
 
-async function loadTrafficChart() {
-    try {
-        const data = await api('/api/traffic');
-        if (!data.success || !data.data.daily_history.length) {
-            document.getElementById('trafficChart').innerHTML = '<div class="empty-state"><div class="icon">📊</div><p>No traffic data yet.</p></div>';
-            document.getElementById('trafficChartLabels').innerHTML = '';
-            return;
-        }
-        const daily = data.data.daily_history.reverse(); // oldest first
-        const maxVal = Math.max(...daily.map(d => d.upload + d.download), 1);
+            if (stats.success) {
+                const d = stats.data;
+                document.getElementById('stat-inbounds').textContent = d.inbound_count;
+                document.getElementById('stat-connections').textContent = d.connection_count;
+                document.getElementById('stat-traffic').textContent = fmtBytes((d.uptime_seconds || 0) * 1024);
+                document.getElementById('stat-cpu').textContent = d.cpu_percent + '% / ' + d.memory_percent + '%';
+            }
 
-        document.getElementById('trafficChart').innerHTML = daily.map(d => {
-            const h = Math.max(((d.upload + d.download) / maxVal * 100), 2);
-            return `<div class="chart-bar-item" style="height:${h}%" title="${d.date}: ${formatBytes(d.upload + d.download)}"></div>`;
-        }).join('');
-        document.getElementById('trafficChartLabels').innerHTML = daily.map(d => {
-            const label = d.date.substring(5); // MM-DD
-            return `<span>${label}</span>`;
-        }).join('');
-    } catch (err) {
-        console.error('Failed to load traffic chart', err);
-    }
-}
-
-async function loadConnections() {
-    try {
-        const data = await api('/api/connections?limit=100');
-        const tbody = document.getElementById('connectionsTableBody');
-        if (!data.data || data.data.length === 0) {
-            tbody.innerHTML = `<tr><td colspan="5" class="empty-state"><div class="icon">📡</div><p>No connections logged yet.</p></td></tr>`;
-        } else {
-            tbody.innerHTML = data.data.map(l => `
-                <tr>
-                    <td style="white-space:nowrap">${formatDate(l.connected_at)}</td>
-                    <td>${escHtml(l.tag || l.inbound_id)}</td>
-                    <td style="color:var(--success)">${formatBytes(l.upload_bytes)}</td>
-                    <td style="color:var(--primary)">${formatBytes(l.download_bytes)}</td>
-                    <td class="hide-mobile text-mono">${escHtml(l.client_ip || '—')}</td>
-                </tr>
-            `).join('');
-        }
-    } catch (err) {
-        console.error('Failed to load connections', err);
-    }
-}
-
-async function loadSystemStats() {
-    try {
-        const data = await api('/api/stats');
-        if (data.success) {
-            const s = data.data;
-            document.getElementById('systemStatsGrid').innerHTML = `
-                <div class="stat-card"><div class="stat-value">${s.cpu_percent}%</div><div class="stat-label">CPU</div></div>
-                <div class="stat-card"><div class="stat-value">${s.memory_percent}%</div><div class="stat-label">Memory (${s.memory_used_gb}/${s.memory_total_gb} GB)</div></div>
-                <div class="stat-card"><div class="stat-value">${s.disk_percent}%</div><div class="stat-label">Disk (${s.disk_free_gb} GB free)</div></div>
-                <div class="stat-card"><div class="stat-value">${s.inbound_count}</div><div class="stat-label">Inbounds</div></div>
-                <div class="stat-card"><div class="stat-value">${s.connection_count}</div><div class="stat-label">Total Connections</div></div>
-                <div class="stat-card"><div class="stat-value">${s.db_size_kb} KB</div><div class="stat-label">DB Size</div></div>
-                <div class="stat-card"><div class="stat-value">${formatUptime(s.uptime_seconds)}</div><div class="stat-label">System Uptime</div></div>
-                <div class="stat-card"><div class="stat-value" style="font-size:0.8rem" title="${s.python_version}">${s.python_version.split('\\n')[0]}</div><div class="stat-label">Python</div></div>
-            `;
-        }
-    } catch (err) {
-        console.error('Failed to load system stats', err);
-    }
-}
-
-function refreshAll() {
-    loadStats();
-    if (activeTab === 'inbounds') loadInbounds();
-    else if (activeTab === 'traffic') loadTrafficChart();
-    else if (activeTab === 'connections') loadConnections();
-    else if (activeTab === 'system') loadSystemStats();
-}
-
-// ═══════════════════════════════════════
-// Inbound CRUD
-// ═══════════════════════════════════════
-function openAddModal() {
-    document.getElementById('addModal').classList.add('active');
-    document.getElementById('addForm').reset();
-    // Set defaults
-    document.getElementById('fieldPort').value = '443';
-    document.getElementById('fieldWSPath').value = '/ws';
-    document.getElementById('fieldUpstreamPort').value = '443';
-    document.getElementById('fieldUpstreamPath').value = '/';
-    document.getElementById('fieldTLS').value = 'tls';
-    document.getElementById('fieldFingerprint').value = 'chrome';
-}
-
-function closeAddModal() {
-    document.getElementById('addModal').classList.remove('active');
-}
-
-async function submitInbound(event) {
-    event.preventDefault();
-    const form = event.target;
-    const formData = new FormData(form);
-    const data = Object.fromEntries(formData.entries());
-
-    // Clean empty strings
-    Object.keys(data).forEach(k => { if (data[k] === '') delete data[k]; });
-
-    // Convert numeric fields
-    if (data.port) data.port = parseInt(data.port);
-    if (data.upstream_port) data.upstream_port = parseInt(data.upstream_port);
-    if (data.expires_in_days) data.expires_in_days = parseInt(data.expires_in_days);
-
-    try {
-        const result = await api('/api/inbounds', {
-            method: 'POST',
-            body: JSON.stringify(data)
-        });
-        if (result.success) {
-            showToast('Inbound created successfully!', 'success');
-            closeAddModal();
-            await loadInbounds();
-            await loadStats();
-        }
-    } catch (err) {
-        // error already shown by api()
-    }
-}
-
-async function deleteInbound(inbound_id) {
-    if (!confirm('Delete this inbound? This cannot be undone.')) return;
-    try {
-        const result = await api('/api/inbounds/' + inbound_id, { method: 'DELETE' });
-        if (result.success) {
-            showToast('Inbound deleted', 'success');
-            await loadInbounds();
-            await loadStats();
-        }
-    } catch (err) {
-        // error already shown
-    }
-}
-
-async function copyLink(inbound_id) {
-    try {
-        const data = await api('/api/inbounds/' + inbound_id + '/vless');
-        if (data.success && data.vless_url) {
-            await navigator.clipboard.writeText(data.vless_url);
-            showToast('VLESS URL copied!', 'success');
-        }
-    } catch (err) {
-        // Try showing QR modal instead
-        showQR(inbound_id);
-    }
-}
-
-async function exportConfigs() {
-    try {
-        const data = await api('/api/export');
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'luffy-configs-' + new Date().toISOString().split('T')[0] + '.json';
-        a.click();
-        URL.revokeObjectURL(url);
-        showToast('Configs exported!', 'success');
-    } catch (err) {
-        // error shown by api()
-    }
-}
-
-// ═══════════════════════════════════════
-// QR Code
-// ═══════════════════════════════════════
-async function showQR(inbound_id) {
-    try {
-        const data = await api('/api/inbounds/' + inbound_id + '/vless');
-        if (data.success && data.vless_url) {
-            currentVlessUrl = data.vless_url;
-            document.getElementById('vlessUrlDisplay').value = data.vless_url;
-            document.getElementById('qrModal').classList.add('active');
-
-            // Generate QR code client-side
-            const container = document.getElementById('qrCodeContainer');
-            container.innerHTML = '';
-            try {
-                new QRCode(container, {
-                    text: data.vless_url,
-                    width: 200,
-                    height: 200,
-                    colorDark: '#000000',
-                    colorLight: '#ffffff',
-                    correctLevel: QRCode.CorrectLevel.M
-                });
-            } catch (e) {
-                container.innerHTML = '<p style="color:var(--danger)">QR generation failed. Use the URL below.</p>';
+            if (inbounds.success) {
+                const tbody = document.getElementById('inbounds-table');
+                if (inbounds.data.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No inbounds yet. Click ➕ New Inbound</td></tr>';
+                } else {
+                    tbody.innerHTML = inbounds.data.map(ib =>
+                        `<tr>
+                            <td><strong>${escHtml(ib.tag)}</strong></td>
+                            <td class="text-mono">${escHtml(ib.uuid).substring(0,12)}...</td>
+                            <td class="text-mono">${escHtml(ib.ws_path)}</td>
+                            <td>${escHtml(ib.upstream_host)}:${ib.upstream_port}</td>
+                            <td>⬆${fmtBytes(ib.total_upload||0)} ⬇${fmtBytes(ib.total_download||0)}</td>
+                            <td>
+                                <button onclick="showQR('${ib.inbound_id}')">📱</button>
+                                <button onclick="deleteInbound('${ib.inbound_id}')" class="danger">🗑</button>
+                            </td>
+                        </tr>`
+                    ).join('');
+                }
             }
         }
-    } catch (err) {
-        // error shown by api()
-    }
-}
 
-function closeQrModal() {
-    document.getElementById('qrModal').classList.remove('active');
-    currentVlessUrl = '';
-}
+        async function createInbound(e) {
+            e.preventDefault();
+            const form = document.getElementById('create-form');
+            const fd = new FormData(form);
+            const data = Object.fromEntries(fd.entries());
+            const result = await api('/api/inbounds', {
+                method: 'POST',
+                body: JSON.stringify(data),
+            });
+            if (result.success) {
+                showToast('✅ Inbound created!');
+                form.reset();
+                document.getElementById('create-card').style.display = 'none';
+                refreshAll();
+            } else {
+                alert('Error: ' + (result.detail || 'Unknown error'));
+            }
+        }
 
-function copyVlessUrl() {
-    const input = document.getElementById('vlessUrlDisplay');
-    if (input.value) {
-        navigator.clipboard.writeText(input.value).then(() => {
-            showToast('Copied to clipboard!', 'success');
-        }).catch(() => {
-            input.select();
-            document.execCommand('copy');
-            showToast('Copied!', 'success');
+        async function deleteInbound(id) {
+            if (!confirm('Delete inbound ' + id + '?')) return;
+            await api('/api/inbounds/' + id, { method: 'DELETE' });
+            showToast('🗑 Deleted');
+            refreshAll();
+        }
+
+        async function showQR(inboundId) {
+            const res = await api('/api/inbounds/' + inboundId + '/vless');
+            if (res.success && res.vless_url) {
+                const modal = document.getElementById('qrcode-modal');
+                modal.classList.add('show');
+                const container = document.getElementById('qrcode-container');
+                container.innerHTML = '';
+                new QRCode(container, { text: res.vless_url, width: 256, height: 256 });
+            }
+        }
+
+        function hideQR() {
+            document.getElementById('qrcode-modal').classList.remove('show');
+        }
+
+        function showCreateForm() {
+            document.getElementById('create-card').style.display = 'block';
+            window.scrollTo({ top: document.getElementById('create-card').offsetTop, behavior: 'smooth' });
+        }
+
+        async function exportConfigs() {
+            const res = await api('/api/export');
+            if (res.success) {
+                const blob = new Blob([JSON.stringify(res.data, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = 'luffy-configs.json'; a.click();
+                URL.revokeObjectURL(url);
+                showToast('📥 Exported!');
+            }
+        }
+
+        function showToast(msg) {
+            const t = document.createElement('div');
+            t.className = 'toast';
+            t.textContent = msg;
+            document.body.appendChild(t);
+            setTimeout(() => t.remove(), 3000);
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            refreshAll();
+            setInterval(refreshAll, 30000);
         });
-    }
-}
-
-function downloadQR() {
-    const canvas = document.querySelector('#qrCodeContainer canvas');
-    if (!canvas) {
-        showToast('No QR code to save', 'error');
-        return;
-    }
-    const link = document.createElement('a');
-    link.download = 'luffy-qr-' + Date.now() + '.png';
-    link.href = canvas.toDataURL('image/png');
-    link.click();
-    showToast('QR code saved!', 'success');
-}
-
-// ═══════════════════════════════════════
-// Utility Functions
-// ═══════════════════════════════════════
-function formatBytes(bytes) {
-    if (!bytes || bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
-
-function formatDate(dateStr) {
-    if (!dateStr) return '—';
-    try {
-        const d = new Date(dateStr + (dateStr.endsWith('Z') ? '' : 'Z'));
-        return d.toLocaleString();
-    } catch (e) {
-        return dateStr;
-    }
-}
-
-function formatUptime(seconds) {
-    const d = Math.floor(seconds / 86400);
-    const h = Math.floor((seconds % 86400) / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const parts = [];
-    if (d) parts.push(d + 'd');
-    if (h) parts.push(h + 'h');
-    if (m) parts.push(m + 'm');
-    return parts.join(' ') || '<1m';
-}
-
-function escHtml(str) {
-    if (!str) return '';
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-}
-
-// ═══════════════════════════════════════
-// Keyboard shortcuts
-// ═══════════════════════════════════════
-document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') {
-        closeAddModal();
-        closeQrModal();
-    }
-});
-
-// Close modals on overlay click
-document.getElementById('addModal').addEventListener('click', function(e) {
-    if (e.target === this) closeAddModal();
-});
-document.getElementById('qrModal').addEventListener('click', function(e) {
-    if (e.target === this) closeQrModal();
-});
-
-// ═══════════════════════════════════════
-// Initialization
-// ═══════════════════════════════════════
-function init() {
-    applyTheme(currentTheme);
-    updateLanguage(currentLang);
-
-    // Turn off RTL for now since the UI is primarily LTR-designed
-    document.documentElement.dir = 'ltr';
-    document.documentElement.lang = 'en';
-
-    loadStats();
-    loadInbounds();
-
-    // Auto-refresh every 30 seconds
-    refreshTimer = setInterval(refreshAll, 30000);
-}
-
-document.addEventListener('DOMContentLoaded', init);
-</script>
-
+    </script>
 </body>
 </html>
 """
-
-
-# ═══════════════════════════════════════════════
-# Health Check
-# ═══════════════════════════════════════════════
-
-@app.get("/health")
-@limiter.exempt
-async def health_check():
-    """Health check endpoint."""
-    db_exists = os.path.exists(DB_PATH)
-    return {
-        "status": "healthy",
-        "version": "2.0.0",
-        "database": "connected" if db_exists else "initializing",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-@app.get("/api/ping")
-@limiter.exempt
-async def ping():
-    """Simple ping endpoint."""
-    return {"ping": "pong", "timestamp": int(time.time())}
-
-
-# ═══════════════════════════════════════════════
-# Main Entry Point
-# ═══════════════════════════════════════════════
 
 if __name__ == "__main__":
     import uvicorn
