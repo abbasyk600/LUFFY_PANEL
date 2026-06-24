@@ -8,10 +8,12 @@ daily traffic history, QR codes, theme detection, export, and more.
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
 import struct
+import subprocess
 import time
 import uuid as uuid_mod
 from contextlib import asynccontextmanager
@@ -171,6 +173,29 @@ def generate_inbound_id() -> str:
 XRAY_CONFIG_PATH = "/etc/xray/config.json"
 XRAY_LOCAL_PORT = 10000
 XRAY_ENABLED = os.path.exists("/usr/local/bin/xray")
+
+
+async def start_xray():
+    """Start Xray-core as a background process."""
+    if not XRAY_ENABLED:
+        return None
+    try:
+        os.makedirs("/data/hf/xray", exist_ok=True)
+        proc = subprocess.Popen(
+            ["/usr/local/bin/xray", "run", "-c", XRAY_CONFIG_PATH],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        await asyncio.sleep(2)
+        if proc.poll() is None:
+            logging.info(f"[Xray] Started (PID: {proc.pid}) on port {XRAY_LOCAL_PORT}")
+            return proc
+        else:
+            logging.error(f"[Xray] Failed to start (exit code: {proc.returncode})")
+            return None
+    except Exception as e:
+        logging.error(f"[Xray] Start error: {e}")
+        return None
 
 
 async def update_xray_config():
@@ -465,7 +490,12 @@ async def lifespan(app: FastAPI):
     print(f"[Luffy Panel] Admin password: {ADMIN_PASSWORD}")
     if XRAY_ENABLED:
         await update_xray_config()
-        print(f"[Luffy Panel] Xray-core integration enabled (port {XRAY_LOCAL_PORT})")
+        xray_proc = await start_xray()
+        if xray_proc:
+            app.state.xray_proc = xray_proc
+            print(f"[Luffy Panel] Xray-core running on port {XRAY_LOCAL_PORT}")
+        else:
+            print("[Luffy Panel] WARNING: Xray-core failed to start")
     else:
         print("[Luffy Panel] Xray-core not found - proxy-only mode")
     cleanup_task = asyncio.create_task(background_cleanup_loop())

@@ -31,24 +31,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # App code
 COPY . .
 
-# Create data dirs and startup script
+# Create data dirs
 RUN mkdir -p /data/hf /etc/xray
 
-RUN printf '#!/bin/bash\n\
-set -e\n\
-echo "[Luffy] Starting Xray-core on port 10000..."\n\
-mkdir -p /data/hf/xray\n\
-xray run -c /etc/xray/config.json &\n\
-XRAY_PID=$!\n\
-sleep 2\n\
-if kill -0 $XRAY_PID 2>/dev/null; then\n\
-    echo "[Luffy] Xray PID=$XRAY_PID running"\n\
-else\n\
-    echo "[Luffy] WARNING: Xray failed to start"\n\
-fi\n\
-echo "[Luffy] Starting panel on :7860"\n\
-exec uvicorn main:app --host 0.0.0.0 --port 7860\n\
-' > /start.sh && chmod +x /start.sh
-
 EXPOSE 7860
-CMD ["/start.sh"]
+
+# Python manages Xray startup via subprocess
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
