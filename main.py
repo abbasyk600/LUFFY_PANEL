@@ -1008,7 +1008,7 @@ async def websocket_tunnel(websocket: WebSocket, inbound_id: str):
 async def dashboard(request: Request):
     """Serve the main dashboard HTML."""
     host = str(request.url.hostname or "localhost")
-    scheme = str(request.url.scheme or "https")
+    scheme = "https"  # HF Spaces always serve HTTPS
     base_url = f"{scheme}://{host}"
 
     return HTMLResponse(content=DASHBOARD_HTML.replace("__BASE_URL__", base_url))
