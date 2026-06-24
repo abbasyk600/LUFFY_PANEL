@@ -701,12 +701,14 @@ async def get_vless_url(
             raise HTTPException(status_code=404, detail="Inbound not found")
 
         request_host = host or str(request.url.hostname or "localhost")
+        # Client connects to HF Space via HTTPS, so VLESS URL always uses tls
+        client_tls = "tls" if request.url.scheme in ("https", "wss") else "tls"
         vless_url = build_vless_url(
             uuid=row["uuid"],
             host=request_host,
             port=row["port"],
             path=row["ws_path"],
-            tls=row["upstream_tls"],
+            tls=client_tls,
             sni=row["sni"] or request_host,
             alpn=row["alpn"],
             fp=row["fingerprint"],
