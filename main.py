@@ -164,6 +164,87 @@ def generate_inbound_id() -> str:
     return secrets.token_hex(6)
 
 
+# ═══════════════════════════════════════════════
+# Xray-core Integration
+# ═══════════════════════════════════════════════
+
+XRAY_CONFIG_PATH = "/etc/xray/config.json"
+XRAY_LOCAL_PORT = 10000
+XRAY_ENABLED = os.path.exists("/usr/local/bin/xray")
+
+
+async def update_xray_config():
+    """Regenerate Xray config with all active inbound UUIDs."""
+    if not XRAY_ENABLED:
+        return
+
+    try:
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                "SELECT uuid, tag FROM inbounds WHERE enabled=1"
+            )
+            rows = await cursor.fetchall()
+        finally:
+            await db.close()
+
+        clients = []
+        for row in rows:
+            clients.append({
+                "id": row["uuid"],
+                "email": row["tag"],
+                "level": 0
+            })
+
+        # Always include a fallback client
+        if not clients:
+            clients.append({"id": str(uuid_mod.uuid4()), "email": "default", "level": 0})
+
+        config = {
+            "log": {
+                "loglevel": "warning",
+                "access": "/data/hf/xray/access.log",
+                "error": "/data/hf/xray/error.log"
+            },
+            "inbounds": [{
+                "port": XRAY_LOCAL_PORT,
+                "listen": "127.0.0.1",
+                "protocol": "vless",
+                "settings": {
+                    "clients": clients,
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp"
+                }
+            }],
+            "outbounds": [
+                {
+                    "protocol": "freedom",
+                    "settings": {},
+                    "tag": "direct"
+                },
+                {
+                    "protocol": "blackhole",
+                    "settings": {},
+                    "tag": "block"
+                }
+            ],
+            "routing": {
+                "domainStrategy": "AsIs",
+                "rules": []
+            }
+        }
+
+        os.makedirs(os.path.dirname(XRAY_CONFIG_PATH), exist_ok=True)
+        with open(XRAY_CONFIG_PATH, "w") as f:
+            json.dump(config, f, indent=2)
+
+        logging.info(f"[Xray] Config updated with {len(clients)} client(s)")
+    except Exception as e:
+        logging.error(f"[Xray] Failed to update config: {e}")
+
+
 def build_vless_url(
     uuid: str,
     host: str,
@@ -382,6 +463,11 @@ async def lifespan(app: FastAPI):
     await init_db()
     print(f"[Luffy Panel] Database initialized at {DB_PATH}")
     print(f"[Luffy Panel] Admin password: {ADMIN_PASSWORD}")
+    if XRAY_ENABLED:
+        await update_xray_config()
+        print(f"[Luffy Panel] Xray-core integration enabled (port {XRAY_LOCAL_PORT})")
+    else:
+        print("[Luffy Panel] Xray-core not found - proxy-only mode")
     cleanup_task = asyncio.create_task(background_cleanup_loop())
     app.state.cleanup_task = cleanup_task
     yield
@@ -488,7 +574,12 @@ async def create_inbound(request: Request):
     expires_in_days = data.get("expires_in_days")
 
     if not upstream_host:
-        raise HTTPException(status_code=400, detail="upstream_host is required")
+        if XRAY_ENABLED:
+            upstream_host = "127.0.0.1"
+            upstream_port = XRAY_LOCAL_PORT
+            upstream_tls = "none"
+        else:
+            raise HTTPException(status_code=400, detail="upstream_host is required")
 
     expires_at = None
     if expires_in_days:
@@ -516,7 +607,7 @@ async def create_inbound(request: Request):
         )
         row = await cursor.fetchone()
 
-        return {
+        result = {
             "success": True,
             "data": {
                 "id": row["id"],
@@ -532,6 +623,8 @@ async def create_inbound(request: Request):
                 "expires_at": row["expires_at"],
             },
         }
+        await update_xray_config()
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -554,6 +647,7 @@ async def delete_inbound(request: Request, inbound_id: str):
         await db.execute("DELETE FROM traffic_history WHERE inbound_id=?", (inbound_id,))
         await db.execute("DELETE FROM connection_logs WHERE inbound_id=?", (inbound_id,))
         await db.commit()
+        await update_xray_config()
         return {"success": True, "message": "Inbound deleted"}
     finally:
         await db.close()
